@@ -1,683 +1,639 @@
-# renderer.py
-# Streamlit-safe impact menu renderer (PowerPoint-style)
-# Drop-in replacement. Requires:
-# - assets/fonts/  (Inter + Playfair .ttf files, any names ok)
-# - assets/backgrounds/ and/or assets/farmers/ (hero images)
-# - assets/crops/ (crop images)
+from __future__ import annotations
 
-import os, glob, random, math
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
-from io import BytesIO
-
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
-
-# ============================================================
-# Paths / Assets
-# ============================================================
 import os
+import math
+import random
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple
 
-# Absolute path to this file's folder (works on Streamlit Cloud)
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+# -------------------------
+# Paths (Streamlit-safe)
+# -------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Assets folder must be inside the repo root next to app.py / renderer.py
 ASSET_ROOT = os.path.join(BASE_DIR, "assets")
 
 FONT_DIR = os.path.join(ASSET_ROOT, "fonts")
 BG_DIR = os.path.join(ASSET_ROOT, "backgrounds")
 CROP_DIR = os.path.join(ASSET_ROOT, "crops")
-FARMER_DIR = os.path.join(ASSET_ROOT, "farmers")
 
-# ============================================================
-# Render settings
-# ============================================================
-TARGET_W, TARGET_H = 1080, 1400
-SCALE = int(os.getenv("SCALE", "2"))  # 2 recommended
+# -------------------------
+# Public constants
+# -------------------------
+PARISH_LIST = ["Clarendon", "Manchester", "St. Elizabeth", "Westmoreland"]
+
+DOMINANT_CROP = {
+    "Clarendon": "hot_pepper",
+    "Manchester": "carrot",
+    "St. Elizabeth": "escallion",
+    "Westmoreland": "banana",
+}
+
+CROP_DISPLAY = {
+    "sweet_potato": "Sweet Potato",
+    "irish_potato": "Irish Potato",
+    "hot_pepper": "Hot Pepper",
+    "carrot": "Carrot",
+    "banana": "Banana",
+    "escallion": "Escallion",
+}
+
+# -------------------------
+# Simple economics (EDIT THESE)
+# -------------------------
+GBP_TO_JMD = 200.0  # rough; for display only
+COST_PER_ACRE_GBP = 1400.0  # tune from your plan
+COST_PER_FARMER_GBP = 2800.0  # tune from your plan
+
+# Parish remaining need (EDIT THESE)
+REMAINING_ACRES = {
+    "Clarendon": 50.0,
+    "Manchester": 50.0,
+    "St. Elizabeth": 50.0,
+    "Westmoreland": 50.0,
+}
+
+# Yield/value model (EDIT THESE)
+# yield_kg_per_acre and value_gbp_per_kg are rough placeholders.
+CROP_MODEL = {
+    "sweet_potato": {"yield_kg_per_acre": 6800, "value_gbp_per_kg": 0.65},
+    "irish_potato": {"yield_kg_per_acre": 5800, "value_gbp_per_kg": 0.85},
+    "hot_pepper": {"yield_kg_per_acre": 2200, "value_gbp_per_kg": 3.00},
+    "carrot": {"yield_kg_per_acre": 6000, "value_gbp_per_kg": 1.10},
+    "banana": {"yield_kg_per_acre": 9000, "value_gbp_per_kg": 0.55},
+    "escallion": {"yield_kg_per_acre": 4200, "value_gbp_per_kg": 1.70},
+}
+
+# Crop allocation weights (dominant crop gets more, potatoes always included)
+ALLOC_WEIGHTS = {
+    "dominant": 0.40,
+    "sweet_potato": 0.35,
+    "irish_potato": 0.25,
+}
+
+# -------------------------
+# Canvas & render quality
+# -------------------------
+TARGET_W, TARGET_H = 1080, 1350     # output PNG size
+SCALE = 2                            # internal render scale for crisp text
 W, H = TARGET_W * SCALE, TARGET_H * SCALE
 
-# ============================================================
-# Project constants (edit later to match your plan)
-# ============================================================
-TOTAL_PROJECT_COST_JMD = 56_557_890
-TOTAL_PROJECT_ACRES = 200
-TOTAL_PROJECT_FARMERS = 100
+# Theme colors
+BG_PAPER = (244, 241, 234)
+GREEN = (21, 67, 49)   # deep green
+GREEN_2 = (30, 90, 63)
+TEXT_DARK = (22, 22, 22)
+TEXT_MUTED = (92, 92, 92)
 
-COST_PER_ACRE_JMD = TOTAL_PROJECT_COST_JMD / TOTAL_PROJECT_ACRES
-ACRES_PER_FARMER = TOTAL_PROJECT_ACRES / TOTAL_PROJECT_FARMERS
-
-FX_JMD_PER_GBP = float(os.getenv("FX_JMD_PER_GBP", "200.0"))
-MICRO_ACRE_THRESHOLD = 0.25  # below this, avoid "acres restored" looking like zero
-
-# Crop mix (potatoes always included)
-SHARE_SWEET_POTATO = 0.45
-SHARE_IRISH_POTATO = 0.15
-SHARE_DOMINANT = 0.40
-
-PARISH_DOMINANT_CROP = {
-    "Clarendon": "hot_pepper",
-    "Westmoreland": "banana",
-    "St. Elizabeth": "escallion",
-    "Manchester": "carrot",
-}
-PARISH_LIST = ["Manchester", "Clarendon", "St. Elizabeth", "Westmoreland"]
-
-# Crop data placeholders (replace with Appendix 2 later)
-CROP_DATA = {
-    "banana":       {"yield_kg_per_acre": 15000, "price_jmd_per_kg": 150},
-    "hot_pepper":   {"yield_kg_per_acre": 5073,  "price_jmd_per_kg": 450},
-    "carrot":       {"yield_kg_per_acre": 5972,  "price_jmd_per_kg": 400},
-    "escallion":    {"yield_kg_per_acre": 4251,  "price_jmd_per_kg": 600},
-    "sweet_potato": {"yield_kg_per_acre": 6883,  "price_jmd_per_kg": 300},
-    "irish_potato": {"yield_kg_per_acre": 5870,  "price_jmd_per_kg": 300},
-}
-
-# ============================================================
-# Theme colors (match your reference)
-# ============================================================
-CREAM = (245, 242, 234)
-PANEL = (250, 248, 242)
-INK = (18, 18, 18)
-MUTED = (78, 78, 78)
-MID = (92, 92, 92)
-BORDER = (224, 218, 204)
-GREEN = (23, 63, 45)
-GREEN_DARK = (16, 48, 35)
-WHITE = (255, 255, 255)
-
-# ============================================================
-# Copy (no em dashes)
-# ============================================================
-PARISH_COPY = {
-    "Manchester": {
-        "hero_template": "{amt} restores farms, livelihoods,\nand the next harvest in Manchester",
-        "hero_sub": "Rebuilding damaged farmland so local farmers can harvest again within one season.",
-        "why_title": "Why this matters",
-        "why_body": ("Severe land damage has left Manchester farmers unable to plant for the upcoming season. "
-                    "Without rapid support, families lose income for an entire year. "
-                    "This recovery enables farmers to replant within the next harvest cycle."),
-        "kpi_title": "What your {amt} achieves:",
-        "crops_line": "Carrot, sweet potato, Irish potato",
-        "crop_body": {
-            "sweet_potato": "Reliable staple crop supporting household food security and fast income recovery.",
-            "irish_potato": "High-yield crop that supports quick market sales and cash flow.",
-            "dominant": "Primary market crop strengthening local supply chains and income stability.",
-        },
-        "quote": "“Without replanting support,\nwe lose the whole year.”\n- Local Manchester farmer",
-        "cta_title": "Restore the next harvest",
-        "cta_body": "Your donation today ensures farmers can plant in time for the next growing season.",
-        "cta_button": "Support recovery now",
-        "cta_note": "Funding closes once planting begins.",
-    },
-    "Clarendon": {
-        "hero_template": "{amt} restores farms, livelihoods,\nand the next harvest in Clarendon",
-        "hero_sub": "Rapid replanting support so farmers can earn again and keep food moving to markets.",
-        "why_title": "Why this matters",
-        "why_body": ("Hurricane damage has disrupted planting schedules and household income. "
-                    "Without immediate support, farmers miss the season and communities face higher food costs. "
-                    "This package helps farmers replant quickly and restart cash flow."),
-        "kpi_title": "What your {amt} achieves:",
-        "crops_line": "Hot pepper, sweet potato, Irish potato",
-        "crop_body": {
-            "sweet_potato": "Fast-growing staple crop supporting food security and quick recovery.",
-            "irish_potato": "High-demand staple that turns planting support into rapid sales.",
-            "dominant": "High-value market crop that restores income and local trade quickly.",
-        },
-        "quote": "“If we miss this season,\nwe fall behind for the whole year.”\n- Clarendon farmer",
-        "cta_title": "Restore the next harvest",
-        "cta_body": "Help farmers replant now so they can harvest and earn again this season.",
-        "cta_button": "Support recovery now",
-        "cta_note": "Funding closes once planting begins.",
-    },
-    "St. Elizabeth": {
-        "hero_template": "{amt} restores farms, livelihoods,\nand the next harvest in St Elizabeth",
-        "hero_sub": "Restoring a key food region so families and markets recover together.",
-        "why_title": "Why this matters",
-        "why_body": ("St Elizabeth supplies food across Jamaica. When land is damaged, farmers lose income and communities lose stable supply. "
-                    "This recovery supports fast replanting so the next harvest arrives on time."),
-        "kpi_title": "What your {amt} achieves:",
-        "crops_line": "Escallion, sweet potato, Irish potato",
-        "crop_body": {
-            "sweet_potato": "Staple crop that improves household resilience and food access.",
-            "irish_potato": "High-yield crop that supports quick turnaround and market sales.",
-            "dominant": "High-demand crop supporting stable supply and stronger local markets.",
-        },
-        "quote": "“When our fields are down,\nour whole community feels it.”\n- St Elizabeth farmer",
-        "cta_title": "Restore the next harvest",
-        "cta_body": "Your donation helps farmers replant now and protects food security for the next season.",
-        "cta_button": "Support recovery now",
-        "cta_note": "Funding closes once planting begins.",
-    },
-    "Westmoreland": {
-        "hero_template": "{amt} restores farms, livelihoods,\nand the next harvest in Westmoreland",
-        "hero_sub": "Stabilising farms after crop loss so families can return to production.",
-        "why_title": "Why this matters",
-        "why_body": ("Crop loss and land damage threaten both food supply and household income. "
-                    "This package supports fast recovery and replanting so farmers can harvest again and rebuild livelihoods."),
-        "kpi_title": "What your {amt} achieves:",
-        "crops_line": "Banana, sweet potato, Irish potato",
-        "crop_body": {
-            "sweet_potato": "Reliable staple crop supporting food security and fast recovery.",
-            "irish_potato": "Quick market crop supporting cash flow and household income.",
-            "dominant": "Longer-horizon income crop rebuilding stability for families and markets.",
-        },
-        "quote": "“We just need help to replant so\nwe can earn again.”\n- Westmoreland farmer",
-        "cta_title": "Restore the next harvest",
-        "cta_body": "Help farmers restart now so they can supply food and return to work this season.",
-        "cta_button": "Support recovery now",
-        "cta_note": "Funding closes once planting begins.",
-    },
-}
-
-
-# Debug (shows in Streamlit logs)
-print("BASE_DIR:", BASE_DIR)
-print("ASSET_ROOT:", ASSET_ROOT)
-print("FONT_DIR:", FONT_DIR)
-print("FONT_DIR exists:", os.path.isdir(FONT_DIR))
-print("FONT files:", os.listdir(FONT_DIR) if os.path.isdir(FONT_DIR) else "missing")
-
-# ============================================================
-# Font auto-detection (works with your filenames)
-# ============================================================
-def _find_font(keywords: List[str]) -> Optional[str]:
-    if not os.path.isdir(FONT_DIR):
-        return None
-    files = glob.glob(os.path.join(FONT_DIR, "*.ttf")) + glob.glob(os.path.join(FONT_DIR, "*.otf"))
-    keys = [k.lower() for k in keywords]
-    scored = []
-    for p in files:
-        name = os.path.basename(p).lower()
-        score = sum(1 for k in keys if k in name)
-        if score:
-            scored.append((score, p))
-    scored.sort(reverse=True, key=lambda x: x[0])
-    return scored[0][1] if scored else None
-
-PLAYFAIR_REG = _find_font(["playfair", "regular"]) or _find_font(["playfair"])
-PLAYFAIR_BOLD = _find_font(["playfair", "bold"]) or _find_font(["playfair", "black"]) or PLAYFAIR_REG
-
-# Pick Inter 24pt regular by preference, but any regular works
-INTER_REG = _find_font(["inter", "24pt", "regular"]) or _find_font(["inter", "regular"]) or _find_font(["inter"])
-INTER_SEMI = _find_font(["inter", "24pt", "semibold"]) or _find_font(["inter", "semibold"]) or _find_font(["inter", "medium"]) or INTER_REG
-INTER_BOLD = _find_font(["inter", "24pt", "bold"]) or _find_font(["inter", "bold"]) or INTER_SEMI
-
-if not PLAYFAIR_REG or not INTER_REG:
-    raise RuntimeError("Fonts not found. Put Inter and Playfair .ttf files into assets/fonts/")
-
-def f_playfair(size: int, bold=False) -> ImageFont.FreeTypeFont:
-    path = PLAYFAIR_BOLD if bold and PLAYFAIR_BOLD else PLAYFAIR_REG
-    return ImageFont.truetype(path, int(size * SCALE))
-
-def f_inter(size: int, weight="reg") -> ImageFont.FreeTypeFont:
-    if weight in ("semi","semibold"):
-        p = INTER_SEMI
-    elif weight == "bold":
-        p = INTER_BOLD
-    else:
-        p = INTER_REG
-    return ImageFont.truetype(p, int(size * SCALE))
-
-# ============================================================
-# Helpers
-# ============================================================
-def fmt_gbp(x: float) -> str:
-    return f"£{x:,.0f}"
-
-def fmt_gbp_smart(x: float) -> str:
-    return f"£{x:.2f}" if x < 1 else f"£{x:,.0f}"
-
-def fmt_acres_smart(acres: float) -> str:
-    if acres <= 0:
-        return "0"
-    if acres < 0.1:
-        return "<0.1"
-    if acres < 10:
-        return f"{acres:.1f}".rstrip("0").rstrip(".")
-    return f"{int(round(acres))}"
-
-def fmt_families_smart(farmers: float) -> str:
-    if farmers <= 0:
-        return "0 families"
-    n = max(1, int(round(farmers)))
-    return "1 family" if n == 1 else f"{n} families"
-
-def fmt_crop(c: str) -> str:
-    return c.replace("_", " ").title()
-
-def list_images(folder: str) -> List[str]:
-    if not os.path.isdir(folder):
-        return []
-    exts = (".jpg", ".jpeg", ".png", ".webp")
-    return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(exts)]
-
-def cover(path: str, size: Tuple[int,int]) -> Image.Image:
-    img = Image.open(path).convert("RGB")
-    return ImageOps.fit(img, size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-
-def grade(img: Image.Image, contrast=1.10, saturation=1.06, brightness=1.00) -> Image.Image:
-    img = ImageEnhance.Contrast(img).enhance(contrast)
-    img = ImageEnhance.Color(img).enhance(saturation)
-    img = ImageEnhance.Brightness(img).enhance(brightness)
-    return img
-
-def pick_crop_photo(crop: str) -> Optional[str]:
-    imgs = list_images(CROP_DIR)
-    if not imgs:
-        return None
-    kw = {
-        "sweet_potato": ["sweet", "sweetpotato"],
-        "irish_potato": ["irish", "potato"],
-        "carrot": ["carrot"],
-        "banana": ["banana"],
-        "hot_pepper": ["pepper", "chili", "chilli", "hot"],
-        "escallion": ["escallion", "scallion", "spring", "onion"],
-    }.get(crop, [crop])
-    filtered = [p for p in imgs if any(k in os.path.basename(p).lower() for k in kw)]
-    return random.choice(filtered if filtered else imgs)
-
-def pick_hero(parish: str, dominant_crop: str) -> Optional[str]:
-    farmers = list_images(FARMER_DIR)
-    if farmers:
-        return random.choice(farmers)
-    bgs = list_images(BG_DIR)
-    if not bgs:
-        return None
-    parish_kw = parish.replace(" ", "_").lower()
-    dom_kw = dominant_crop.lower()
-    filtered = [p for p in bgs if (parish_kw in os.path.basename(p).lower()) or (dom_kw in os.path.basename(p).lower())]
-    return random.choice(filtered if filtered else bgs)
-
-def rounded(draw: ImageDraw.ImageDraw, box, r=24, fill=None, outline=None, w=2):
-    draw.rounded_rectangle(box, radius=r, fill=fill, outline=outline, width=w if outline else 0)
-
-def soft_shadow(canvas: Image.Image, box, r=24, blur=20, alpha=65):
-    x0,y0,x1,y1 = box
-    sh = Image.new("RGBA", canvas.size, (0,0,0,0))
-    d = ImageDraw.Draw(sh)
-    d.rounded_rectangle((x0,y0,x1,y1), radius=r, fill=(0,0,0,alpha))
-    sh = sh.filter(ImageFilter.GaussianBlur(blur))
-    canvas.paste(sh, (0,0), sh)
-
-def hero_left_gradient(base: Image.Image, hero_h: int):
-    ov = Image.new("RGBA", (W, hero_h), (0,0,0,0))
-    d = ImageDraw.Draw(ov)
-    for x in range(W):
-        a = int(240 * max(0, 1 - x/(W*0.52)))
-        d.line([(x,0),(x,hero_h)], fill=(0,0,0,a))
-    base.paste(ov, (0,0), ov)
-
-def bottom_fade(img: Image.Image, box, strength=185):
-    x0,y0,x1,y1 = box
-    ww,hh = x1-x0, y1-y0
-    ov = Image.new("RGBA", (ww,hh), (0,0,0,0))
-    d = ImageDraw.Draw(ov)
-    for yy in range(hh):
-        a = int(strength * (yy / max(1,hh)))
-        d.line([(0,yy),(ww,yy)], fill=(0,0,0,a))
-    img.paste(ov, (x0,y0), ov)
-
-# --------------------------
-# Text box wrapping + autoshrink (prevents overflow)
-# --------------------------
-def _wrap_lines(draw, text, font, max_w):
-    words = text.split()
-    lines, line = [], []
-    for w_ in words:
-        t = " ".join(line + [w_])
-        if draw.textlength(t, font=font) <= max_w:
-            line.append(w_)
-        else:
-            if line:
-                lines.append(" ".join(line))
-            line = [w_]
-    if line:
-        lines.append(" ".join(line))
-    return lines
-
-def _block_height(font, n_lines, line_spacing_px):
-    ascent, descent = font.getmetrics()
-    line_h = ascent + descent
-    return n_lines * line_h + max(0, n_lines-1) * line_spacing_px
-
-def draw_text_in_box(draw, box, text, font_func, start_size,
-                     min_size=12, fill=(0,0,0),
-                     align="left", valign="top",
-                     line_spacing=6, max_lines=None,
-                     ellipsis=True, shadow=None):
-    x0,y0,x1,y1 = box
-    max_w, max_h = x1-x0, y1-y0
-    size = start_size
-
-    while size >= min_size:
-        font = font_func(size)
-        lines = _wrap_lines(draw, text, font, max_w)
-        if max_lines is not None:
-            lines = lines[:max_lines]
-        h = _block_height(font, len(lines), int(line_spacing*SCALE))
-        if h <= max_h:
-            break
-        size -= 1
-
-    font = font_func(max(size, min_size))
-    lines = _wrap_lines(draw, text, font, max_w)
-    if max_lines is not None:
-        lines = lines[:max_lines]
-
-    h = _block_height(font, len(lines), int(line_spacing*SCALE))
-    if h > max_h and ellipsis and lines:
-        last = lines[-1]
-        while last and draw.textlength(last + "…", font=font) > max_w:
-            last = " ".join(last.split()[:-1])
-        lines[-1] = (last + "…") if last else "…"
-
-    h = _block_height(font, len(lines), int(line_spacing*SCALE))
-    if valign == "center":
-        ty = y0 + (max_h - h)//2
-    elif valign == "bottom":
-        ty = y1 - h
-    else:
-        ty = y0
-
-    ascent, descent = font.getmetrics()
-    line_h = ascent + descent
-    ls = int(line_spacing*SCALE)
-
-    for line in lines:
-        lw = draw.textlength(line, font=font)
-        if align == "center":
-            tx = x0 + (max_w - lw)//2
-        elif align == "right":
-            tx = x1 - lw
-        else:
-            tx = x0
-
-        if shadow:
-            dx = shadow.get("dx", 2*SCALE)
-            dy = shadow.get("dy", 2*SCALE)
-            scol = shadow.get("fill", (0,0,0,160))
-            draw.text((tx+dx, ty+dy), line, font=font, fill=scol)
-
-        draw.text((tx, ty), line, font=font, fill=fill)
-        ty += line_h + ls
-
-# ============================================================
-# Impact computation
-# ============================================================
-def donation_to_acres(gbp: float) -> float:
-    return (gbp * FX_JMD_PER_GBP) / COST_PER_ACRE_JMD if COST_PER_ACRE_JMD > 0 else 0.0
-
-def acres_to_farmers(acres: float) -> float:
-    return acres / ACRES_PER_FARMER if ACRES_PER_FARMER > 0 else 0.0
-
-def crop_yield_kg(crop: str, acres: float) -> float:
-    return acres * CROP_DATA[crop]["yield_kg_per_acre"]
-
-def crop_value_jmd(crop: str, acres: float) -> float:
-    return crop_yield_kg(crop, acres) * CROP_DATA[crop]["price_jmd_per_kg"]
+# -------------------------
+# Data types
+# -------------------------
+@dataclass
+class CropImpact:
+    key: str
+    acres: float
+    value_gbp: float
 
 @dataclass
 class Impact:
     donation_gbp: float
     parish: str
-    dominant_crop: str
-    acres: float
-    farmers: float
-    acres_sp: float
-    acres_ip: float
-    acres_dom: float
-    value_gbp: float
+    acres_restored: float
+    farmers_supported: float
+    crops: List[CropImpact]
+    projected_value_gbp: float
 
-def compute_impact(donation_gbp: float, parish: Optional[str] = None) -> Impact:
-    if parish is None:
-        parish = random.choice(PARISH_LIST)
-    dominant = PARISH_DOMINANT_CROP[parish]
 
-    acres = donation_to_acres(donation_gbp)
-    farmers = acres_to_farmers(acres)
+# -------------------------
+# Formatting helpers
+# -------------------------
+def fmt_gbp(x: float) -> str:
+    return f"£{int(round(x)):,}"
 
-    acres_sp = acres * SHARE_SWEET_POTATO
-    acres_ip = acres * SHARE_IRISH_POTATO
-    acres_dom = acres * SHARE_DOMINANT
+def fmt_acres(x: float) -> str:
+    if x < 1:
+        return f"{x:.1f} acres"
+    return f"{x:.0f} acres" if x >= 10 else f"{x:.1f} acres"
 
-    v_jmd = (
-        crop_value_jmd("sweet_potato", acres_sp) +
-        crop_value_jmd("irish_potato", acres_ip) +
-        crop_value_jmd(dominant, acres_dom)
+def clamp(a, lo, hi):
+    return max(lo, min(hi, a))
+
+# -------------------------
+# Font loading (no crashes)
+# -------------------------
+def _font_path(name: str) -> str:
+    return os.path.join(FONT_DIR, name)
+
+def _first_existing(paths: List[str]) -> Optional[str]:
+    for p in paths:
+        if os.path.isfile(p):
+            return p
+    return None
+
+def load_fonts() -> Dict[str, str]:
+    if not os.path.isdir(FONT_DIR):
+        return {}
+
+    playfair = {
+        "reg": _first_existing([
+            _font_path("PlayfairDisplay-Regular.ttf"),
+        ]),
+        "semibold": _first_existing([
+            _font_path("PlayfairDisplay-SemiBold.ttf"),
+            _font_path("PlayfairDisplay-Bold.ttf"),
+        ]),
+        "bold": _first_existing([
+            _font_path("PlayfairDisplay-Bold.ttf"),
+            _font_path("PlayfairDisplay-ExtraBold.ttf"),
+        ]),
+    }
+
+    inter = {
+        "reg": _first_existing([
+            _font_path("Inter_24pt-Regular.ttf"),
+            _font_path("Inter_18pt-Regular.ttf"),
+        ]),
+        "semibold": _first_existing([
+            _font_path("Inter_24pt-SemiBold.ttf"),
+            _font_path("Inter_18pt-SemiBold.ttf"),
+        ]),
+        "bold": _first_existing([
+            _font_path("Inter_24pt-Bold.ttf"),
+            _font_path("Inter_18pt-Bold.ttf"),
+        ]),
+        "xbold": _first_existing([
+            _font_path("Inter_24pt-ExtraBold.ttf"),
+            _font_path("Inter_18pt-ExtraBold.ttf"),
+        ]),
+    }
+
+    # keep only those found
+    out = {}
+    for k, v in playfair.items():
+        if v: out[f"playfair_{k}"] = v
+    for k, v in inter.items():
+        if v: out[f"inter_{k}"] = v
+    return out
+
+FONTS = load_fonts()
+
+def _ttf(path: Optional[str], size: int) -> ImageFont.FreeTypeFont:
+    # fallback to default bitmap font if not found
+    if not path or (not os.path.isfile(path)):
+        return ImageFont.load_default()
+    return ImageFont.truetype(path, size)
+
+def f_playfair(size: int, weight="reg"):
+    return _ttf(FONTS.get(f"playfair_{weight}"), size)
+
+def f_inter(size: int, weight="reg"):
+    return _ttf(FONTS.get(f"inter_{weight}"), size)
+
+
+# -------------------------
+# Text layout helpers (prevents overflow)
+# -------------------------
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_w: int) -> List[str]:
+    words = text.split()
+    lines = []
+    cur = []
+    for w in words:
+        trial = " ".join(cur + [w])
+        tw = draw.textbbox((0, 0), trial, font=font)[2]
+        if tw <= max_w:
+            cur.append(w)
+        else:
+            if cur:
+                lines.append(" ".join(cur))
+            cur = [w]
+    if cur:
+        lines.append(" ".join(cur))
+    return lines
+
+def fit_font_size(draw: ImageDraw.ImageDraw, text: str, font_fn, max_w: int, max_h: int,
+                  start: int, min_size: int, line_gap: int) -> Tuple[ImageFont.FreeTypeFont, List[str], int]:
+    size = start
+    while size >= min_size:
+        font = font_fn(size)
+        lines = wrap_text(draw, text, font, max_w)
+        line_h = draw.textbbox((0, 0), "Ag", font=font)[3]
+        total_h = len(lines) * line_h + (len(lines) - 1) * line_gap
+        widest = max(draw.textbbox((0, 0), ln, font=font)[2] for ln in lines) if lines else 0
+        if widest <= max_w and total_h <= max_h:
+            return font, lines, line_h
+        size -= 1
+    font = font_fn(min_size)
+    lines = wrap_text(draw, text, font, max_w)
+    line_h = draw.textbbox((0, 0), "Ag", font=font)[3]
+    return font, lines, line_h
+
+def draw_text_block(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int],
+                    text: str, font_fn, start_size: int, min_size: int,
+                    fill=(255,255,255), line_gap=8, align="left",
+                    shadow: Optional[Dict]=None):
+    x0, y0, x1, y1 = box
+    max_w = x1 - x0
+    max_h = y1 - y0
+    font, lines, line_h = fit_font_size(draw, text, font_fn, max_w, max_h, start_size, min_size, line_gap)
+
+    total_h = len(lines) * line_h + (len(lines) - 1) * line_gap
+    y = y0 + (max_h - total_h)//2
+
+    for ln in lines:
+        tw = draw.textbbox((0, 0), ln, font=font)[2]
+        if align == "center":
+            x = x0 + (max_w - tw)//2
+        elif align == "right":
+            x = x1 - tw
+        else:
+            x = x0
+
+        if shadow:
+            draw.text((x + shadow.get("dx", 2), y + shadow.get("dy", 2)), ln, font=font, fill=shadow.get("fill", (0,0,0,150)))
+        draw.text((x, y), ln, font=font, fill=fill)
+        y += line_h + line_gap
+
+
+# -------------------------
+# Image helpers
+# -------------------------
+def safe_open_image(path: str) -> Optional[Image.Image]:
+    try:
+        if path and os.path.isfile(path):
+            return Image.open(path).convert("RGB")
+    except:
+        return None
+    return None
+
+def center_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    w, h = img.size
+    scale = max(target_w / w, target_h / h)
+    nw, nh = int(w * scale), int(h * scale)
+    img2 = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    x0 = (nw - target_w) // 2
+    y0 = (nh - target_h) // 2
+    return img2.crop((x0, y0, x0 + target_w, y0 + target_h))
+
+def hero_left_gradient(base: Image.Image, hero_h: int):
+    # darken left/top for text readability
+    overlay = Image.new("RGBA", (W, hero_h), (0,0,0,0))
+    px = overlay.load()
+    for y in range(hero_h):
+        for x in range(W):
+            # stronger on left, subtle on top
+            a = int(170 * (1 - x / (W * 0.75)))
+            a = max(0, min(170, a))
+            top = int(35 * (1 - y / hero_h))
+            a = max(a, top)
+            px[x, y] = (0,0,0,a)
+    base.paste(overlay, (0,0), overlay)
+
+def rounded_panel(draw: ImageDraw.ImageDraw, box, radius, fill, outline=None, width=1):
+    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
+def pick_image(folder: str, keys: List[str], used: set) -> Optional[Image.Image]:
+    """
+    Try keys in order; avoid duplicates using `used` set.
+    Looks for jpg/jpeg/png.
+    """
+    exts = [".jpg", ".jpeg", ".png", ".webp"]
+    for k in keys:
+        for ext in exts:
+            p = os.path.join(folder, k + ext)
+            if p in used:
+                continue
+            img = safe_open_image(p)
+            if img is not None:
+                used.add(p)
+                return img
+    return None
+
+
+# -------------------------
+# Impact calculation
+# -------------------------
+def choose_parish(donation: float) -> str:
+    # simple rule: pick the parish with the most remaining need
+    return max(REMAINING_ACRES.items(), key=lambda kv: kv[1])[0]
+
+def compute_impact(donation_gbp: float, parish: Optional[str]) -> Impact:
+    parish_final = parish if parish in PARISH_LIST else choose_parish(donation_gbp)
+
+    acres = donation_gbp / COST_PER_ACRE_GBP
+    acres = min(acres, REMAINING_ACRES.get(parish_final, acres))
+    acres = max(0.0, acres)
+
+    farmers = donation_gbp / COST_PER_FARMER_GBP
+    farmers = max(0.0, farmers)
+
+    dom = DOMINANT_CROP[parish_final]
+
+    # always include potatoes + dominant
+    weights = [
+        ("sweet_potato", ALLOC_WEIGHTS["sweet_potato"]),
+        ("irish_potato", ALLOC_WEIGHTS["irish_potato"]),
+        (dom, ALLOC_WEIGHTS["dominant"]),
+    ]
+    s = sum(w for _, w in weights)
+    crops = []
+    total_value = 0.0
+    for ck, w in weights:
+        a = acres * (w / s)
+        model = CROP_MODEL[ck]
+        v = a * model["yield_kg_per_acre"] * model["value_gbp_per_kg"]
+        crops.append(CropImpact(key=ck, acres=a, value_gbp=v))
+        total_value += v
+
+    return Impact(
+        donation_gbp=donation_gbp,
+        parish=parish_final,
+        acres_restored=acres,
+        farmers_supported=farmers,
+        crops=crops,
+        projected_value_gbp=total_value,
     )
-    v_gbp = v_jmd / FX_JMD_PER_GBP if FX_JMD_PER_GBP else 0.0
 
-    return Impact(donation_gbp, parish, dominant, acres, farmers, acres_sp, acres_ip, acres_dom, v_gbp)
 
-# ============================================================
-# Main renderer
-# ============================================================
+# -------------------------
+# Copy (stronger, parish-aware)
+# -------------------------
+def hero_subline(parish: str) -> str:
+    if parish == "Clarendon":
+        return "Rapid replanting support so farmers can earn again and keep food moving to markets."
+    if parish == "Manchester":
+        return "Rebuilding damaged farmland so local farmers can harvest again within one season."
+    if parish == "St. Elizabeth":
+        return "Restoring a key food region so families and markets recover together."
+    if parish == "Westmoreland":
+        return "Stabilising farms after crop loss so families can return to production."
+    return "Helping farmers return to work and rebuild food production after Hurricane Melissa."
+
+def why_matters(parish: str) -> str:
+    if parish == "Clarendon":
+        return ("Hurricane damage has disrupted planting schedules and household income. Without immediate support, "
+                "farmers miss the season and communities face higher food costs. This package helps farmers replant quickly "
+                "and restart cash flow.")
+    if parish == "Manchester":
+        return ("Severe land damage has left farmers unable to plant for the upcoming season. Without rapid support, "
+                "families lose income for an entire year. This recovery enables farmers to replant in time for the next harvest cycle.")
+    if parish == "St. Elizabeth":
+        return ("St Elizabeth supplies food across Jamaica. When land is damaged, farmers lose income and communities lose stable supply. "
+                "This recovery supports fast replanting so the next harvest arrives on time.")
+    if parish == "Westmoreland":
+        return ("Crop loss and land damage threaten both food supply and household income. This package supports fast recovery and replanting "
+                "so farmers can harvest again and rebuild livelihoods.")
+    return "This package restores farmland and supports farming families to return to work."
+
+def crop_blurb(ck: str) -> str:
+    return {
+        "sweet_potato": "Staple crop that improves household resilience and food access.",
+        "irish_potato": "Quick market crop supporting cash flow and household income.",
+        "hot_pepper": "High-value market crop that restores income and local trade quickly.",
+        "carrot": "Primary market crop strengthening local supply chains and income stability.",
+        "banana": "Longer-horizon income crop rebuilding stability for families and markets.",
+        "escallion": "High-demand crop supporting stable supply and stronger local markets.",
+    }[ck]
+
+
+# -------------------------
+# Main renderer (PNG)
+# -------------------------
 def render_impact_menu_png(donation_gbp: float, parish: Optional[str] = None) -> Tuple[bytes, Impact]:
-    imp = compute_impact(donation_gbp, parish=parish)
-    copy = PARISH_COPY[imp.parish]
+    imp = compute_impact(donation_gbp, parish)
 
-    base = Image.new("RGB", (W, H), CREAM)
+    # Canvas
+    base = Image.new("RGB", (W, H), BG_PAPER)
     draw = ImageDraw.Draw(base)
 
-    hero_path = pick_hero(imp.parish, imp.dominant_crop)
-    if not hero_path:
-        raise FileNotFoundError("Add hero images to assets/farmers/ or assets/backgrounds/")
+    # Hero image
+    hero_h = int(0.36 * H)
+    used = set()
 
-    # HERO
-    hero_h = int(0.37 * H)
-    hero = grade(cover(hero_path, (W, hero_h)), contrast=1.10, saturation=1.06)
+    # background choice priority: parish-specific -> generic
+    hero_img = pick_image(BG_DIR, [f"hero_{imp.parish.lower().replace(' ','_')}", "hero_generic"], used)
+    if hero_img is None:
+        # fallback: soft gradient background
+        hero = Image.new("RGB", (W, hero_h), (40, 50, 45))
+    else:
+        hero = center_crop(hero_img, W, hero_h)
+
     base.paste(hero, (0, 0))
+
+    # Dark gradient for text readability
     hero_left_gradient(base, hero_h)
 
-    # Headline and subline in controlled boxes
-    headline = copy["hero_template"].format(amt=fmt_gbp(imp.donation_gbp))
-    draw_text_in_box(
+    # Extra blurred panel behind headline for consistent legibility
+    overlay = Image.new("RGBA", (W, hero_h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    od.rounded_rectangle(
+        (55*SCALE, 45*SCALE, int(0.94*W), hero_h-70*SCALE),
+        radius=28*SCALE,
+        fill=(0, 0, 0, 90)
+    )
+    overlay = overlay.filter(ImageFilter.GaussianBlur(10*SCALE))
+    base.paste(overlay, (0, 0), overlay)
+
+    # Headline
+    headline = f"{fmt_gbp(imp.donation_gbp)} restores farms, livelihoods,\nand the next harvest in {imp.parish}"
+    draw_text_block(
         draw,
-        (70*SCALE, 70*SCALE, int(0.92*W), hero_h-110*SCALE),
+        (70*SCALE, 55*SCALE, int(0.94*W), int(hero_h*0.72)),
         headline,
-        lambda s: f_playfair(s, bold=True),
-        start_size=56,
-        min_size=30,
-        fill=WHITE,
-        line_spacing=12,
-        max_lines=3,
+        lambda s: f_playfair(s, "bold"),
+        start_size=64*SCALE,
+        min_size=40*SCALE,
+        fill=(255,255,255),
+        line_gap=10*SCALE,
+        align="left",
         shadow={"dx":2*SCALE, "dy":2*SCALE, "fill":(0,0,0,170)}
     )
 
-    draw_text_in_box(
+    # Subline
+    draw_text_block(
         draw,
-        (70*SCALE, hero_h-120*SCALE, int(0.92*W), hero_h-70*SCALE),
-        copy["hero_sub"],
+        (70*SCALE, int(hero_h*0.73), int(0.94*W), hero_h-20*SCALE),
+        hero_subline(imp.parish),
         lambda s: f_inter(s, "reg"),
-        start_size=22,
-        min_size=15,
-        fill=WHITE,
-        line_spacing=8,
-        max_lines=2,
-        shadow={"dx":2*SCALE, "dy":2*SCALE, "fill":(0,0,0,140)}
+        start_size=26*SCALE,
+        min_size=20*SCALE,
+        fill=(235,235,235),
+        line_gap=6*SCALE,
+        align="left",
+        shadow={"dx":2*SCALE, "dy":2*SCALE, "fill":(0,0,0,120)}
     )
 
-    # WHY PANEL
-    y = int(0.33 * H)
-    why_box = (50*SCALE, y, W-50*SCALE, y+165*SCALE)
-    soft_shadow(base, why_box, r=26*SCALE, blur=22*SCALE, alpha=55)
-    rounded(draw, why_box, r=26*SCALE, fill=PANEL, outline=BORDER, w=2*SCALE)
+    # Panels start
+    y = hero_h + 26*SCALE
 
-    draw_text_in_box(draw, (80*SCALE, y+18*SCALE, W-80*SCALE, y+64*SCALE),
-                     copy["why_title"], lambda s: f_playfair(s, bold=False),
-                     start_size=30, min_size=20, fill=INK)
+    # Why matters panel
+    why_box = (55*SCALE, y, W-55*SCALE, y + 185*SCALE)
+    rounded_panel(draw, why_box, radius=26*SCALE, fill=(249, 247, 242), outline=(215, 208, 195), width=2)
+    # Title
+    draw_text_block(
+        draw, (why_box[0]+28*SCALE, why_box[1]+18*SCALE, why_box[2]-28*SCALE, why_box[1]+62*SCALE),
+        "Why this matters",
+        lambda s: f_playfair(s, "semibold"),
+        start_size=34*SCALE, min_size=28*SCALE,
+        fill=TEXT_DARK, line_gap=6*SCALE, align="left"
+    )
+    # divider
+    draw.line((why_box[0]+300*SCALE, why_box[1]+56*SCALE, why_box[2]-30*SCALE, why_box[1]+56*SCALE), fill=(190, 180, 165), width=2)
+    # Body
+    draw_text_block(
+        draw, (why_box[0]+28*SCALE, why_box[1]+70*SCALE, why_box[2]-28*SCALE, why_box[3]-18*SCALE),
+        why_matters(imp.parish),
+        lambda s: f_inter(s, "reg"),
+        start_size=22*SCALE, min_size=18*SCALE,
+        fill=(40,40,40), line_gap=6*SCALE, align="left"
+    )
 
-    draw.line((330*SCALE, y+56*SCALE, W-80*SCALE, y+56*SCALE), fill=(210,205,192), width=2*SCALE)
+    y = why_box[3] + 22*SCALE
 
-    draw_text_in_box(draw, (80*SCALE, y+72*SCALE, W-80*SCALE, y+154*SCALE),
-                     copy["why_body"], lambda s: f_inter(s, "reg"),
-                     start_size=20, min_size=16, fill=INK,
-                     line_spacing=10, max_lines=3, ellipsis=True)
+    # KPI band
+    kpi_box = (55*SCALE, y, W-55*SCALE, y + 165*SCALE)
+    rounded_panel(draw, kpi_box, radius=28*SCALE, fill=GREEN, outline=None, width=0)
 
-    # KPI BAND
-    y = y + 185*SCALE
-    kpi_box = (50*SCALE, y, W-50*SCALE, y+180*SCALE)
-    soft_shadow(base, kpi_box, r=26*SCALE, blur=24*SCALE, alpha=65)
-    rounded(draw, kpi_box, r=26*SCALE, fill=GREEN, outline=None)
+    # band header
+    draw_text_block(
+        draw,
+        (kpi_box[0]+30*SCALE, kpi_box[1]+18*SCALE, kpi_box[2]-30*SCALE, kpi_box[1]+60*SCALE),
+        f"What your {fmt_gbp(imp.donation_gbp)} achieves:",
+        lambda s: f_playfair(s, "semibold"),
+        start_size=32*SCALE, min_size=26*SCALE,
+        fill=(235, 240, 236),
+        line_gap=6*SCALE,
+        align="left"
+    )
+    draw.line((kpi_box[0]+280*SCALE, kpi_box[1]+60*SCALE, kpi_box[2]-30*SCALE, kpi_box[1]+60*SCALE),
+              fill=(235,240,236,120), width=2)
 
-    is_micro = (imp.acres > 0) and (imp.acres < MICRO_ACRE_THRESHOLD)
-    kpi_title = copy["kpi_title"].format(amt=fmt_gbp(imp.donation_gbp))
-    if is_micro:
-        kpi_title = f"What your {fmt_gbp(imp.donation_gbp)} starts today:"
-
-    draw_text_in_box(draw, (80*SCALE, y+12*SCALE, W-80*SCALE, y+64*SCALE),
-                     kpi_title, lambda s: f_playfair(s, bold=True),
-                     start_size=28, min_size=18, fill=WHITE, max_lines=1)
-
-    draw.line((420*SCALE, y+56*SCALE, W-80*SCALE, y+56*SCALE), fill=(255,255,255,80), width=2*SCALE)
-    draw.line((390*SCALE, y+70*SCALE, 390*SCALE, y+170*SCALE), fill=(255,255,255,70), width=2*SCALE)
-    draw.line((710*SCALE, y+70*SCALE, 710*SCALE, y+170*SCALE), fill=(255,255,255,70), width=2*SCALE)
-
-    fam_txt = fmt_families_smart(imp.farmers)
-    acres_txt = f"{fmt_acres_smart(imp.acres)} acres"
-    crops_txt = copy["crops_line"]
-
-    # Farmers column
-    draw_text_in_box(draw, (95*SCALE, y+74*SCALE, 370*SCALE, y+106*SCALE),
-                     "Farmers supported", lambda s: f_inter(s, "semi"),
-                     start_size=18, min_size=14, fill=WHITE, max_lines=1)
-    draw_text_in_box(draw, (95*SCALE, y+104*SCALE, 370*SCALE, y+170*SCALE),
-                     fam_txt, lambda s: f_playfair(s, bold=True),
-                     start_size=40, min_size=22, fill=WHITE, max_lines=1)
-
-    # Land column
-    draw_text_in_box(draw, (430*SCALE, y+74*SCALE, 690*SCALE, y+106*SCALE),
-                     "Land restored", lambda s: f_inter(s, "semi"),
-                     start_size=18, min_size=14, fill=WHITE, max_lines=1)
-    draw_text_in_box(draw, (430*SCALE, y+104*SCALE, 690*SCALE, y+170*SCALE),
-                     acres_txt, lambda s: f_playfair(s, bold=True),
-                     start_size=40, min_size=22, fill=WHITE, max_lines=1)
-
-    # Crops column (wrap safely)
-    draw_text_in_box(draw, (740*SCALE, y+74*SCALE, W-80*SCALE, y+106*SCALE),
-                     "Crops replanted", lambda s: f_inter(s, "semi"),
-                     start_size=18, min_size=14, fill=WHITE, max_lines=1)
-    draw_text_in_box(draw, (740*SCALE, y+106*SCALE, W-80*SCALE, y+170*SCALE),
-                     crops_txt, lambda s: f_inter(s, "reg"),
-                     start_size=20, min_size=14, fill=WHITE, max_lines=2, ellipsis=True)
-
-    # Crop cards
-    y = y + 205*SCALE
-    gap = 18*SCALE
-    card_w = (W - 100*SCALE - 2*gap)//3
-    card_h = 310*SCALE
-    xs = [50*SCALE, 50*SCALE + card_w + gap, 50*SCALE + 2*(card_w + gap)]
-
-    cards = [
-        ("Sweet Potato", "sweet_potato", imp.acres_sp, copy["crop_body"]["sweet_potato"]),
-        ("Irish Potato", "irish_potato", imp.acres_ip, copy["crop_body"]["irish_potato"]),
-        (fmt_crop(imp.dominant_crop), imp.dominant_crop, imp.acres_dom, copy["crop_body"]["dominant"]),
+    # KPIs
+    col_w = (kpi_box[2]-kpi_box[0])//3
+    cols = [
+        ("Farmers supported", f"{math.floor(imp.farmers_supported):,} families" if imp.farmers_supported >= 2 else "1 family"),
+        ("Land restored", fmt_acres(imp.acres_restored)),
+        ("Crops replanted", ", ".join([CROP_DISPLAY[c.key] for c in imp.crops])),
     ]
 
-    for i,(title,crop,acres,body) in enumerate(cards):
-        x0 = xs[i]
-        box = (x0, y, x0+card_w, y+card_h)
-        soft_shadow(base, box, r=22*SCALE, blur=18*SCALE, alpha=55)
-        rounded(draw, box, r=22*SCALE, fill=WHITE, outline=BORDER, w=2*SCALE)
+    for i, (label, value) in enumerate(cols):
+        x0 = kpi_box[0] + i*col_w + 30*SCALE
+        x1 = kpi_box[0] + (i+1)*col_w - 30*SCALE
+        # label
+        draw_text_block(
+            draw, (x0, kpi_box[1]+68*SCALE, x1, kpi_box[1]+98*SCALE),
+            label,
+            lambda s: f_inter(s, "semibold"),
+            start_size=20*SCALE, min_size=16*SCALE,
+            fill=(230, 238, 233),
+            line_gap=4*SCALE,
+            align="left"
+        )
+        # value
+        draw_text_block(
+            draw, (x0, kpi_box[1]+98*SCALE, x1, kpi_box[3]-16*SCALE),
+            value,
+            lambda s: f_playfair(s, "bold"),
+            start_size=40*SCALE, min_size=22*SCALE,
+            fill=(245, 248, 246),
+            line_gap=6*SCALE,
+            align="left"
+        )
+        if i < 2:
+            vx = kpi_box[0] + (i+1)*col_w
+            draw.line((vx, kpi_box[1]+70*SCALE, vx, kpi_box[3]-22*SCALE), fill=(255,255,255,90), width=3)
 
-        img_path = pick_crop_photo(crop) or hero_path
-        img = grade(cover(img_path, (card_w, 165*SCALE)), contrast=1.06, saturation=1.08)
-        base.paste(img, (x0, y))
+    y = kpi_box[3] + 22*SCALE
 
-        # Title
-        draw_text_in_box(draw, (x0+18*SCALE, y+175*SCALE, x0+card_w-18*SCALE, y+210*SCALE),
-                         title, lambda s: f_playfair(s, bold=True),
-                         start_size=24, min_size=18, fill=INK, max_lines=1)
+    # Crop cards
+    card_h = 270*SCALE
+    card_gap = 18*SCALE
+    card_w = (W - 55*SCALE*2 - card_gap*2)//3
 
-        # Acres line (never overflow)
-        if imp.acres <= 0:
-            subline = "Included in recovery mix"
+    crop_keys = [c.key for c in imp.crops]  # already dominant + potatoes
+    crop_imgs_used = set()
+
+    for i, ck in enumerate(crop_keys):
+        cx0 = 55*SCALE + i*(card_w + card_gap)
+        cx1 = cx0 + card_w
+        cy0 = y
+        cy1 = y + card_h
+
+        rounded_panel(draw, (cx0, cy0, cx1, cy1), radius=22*SCALE, fill=(255,255,255), outline=(220, 212, 200), width=2)
+
+        # image area
+        img_h = 140*SCALE
+        img = pick_image(CROP_DIR, [ck], crop_imgs_used)
+        if img is None:
+            # fallback neutral placeholder
+            ph = Image.new("RGB", (card_w, img_h), (230, 225, 215))
+            base.paste(ph, (cx0, cy0))
         else:
-            subline = f"{fmt_acres_smart(acres)} acres restored"
-        draw_text_in_box(draw, (x0+18*SCALE, y+210*SCALE, x0+card_w-18*SCALE, y+245*SCALE),
-                         subline, lambda s: f_inter(s, "semi"),
-                         start_size=18, min_size=14, fill=INK, max_lines=1)
+            base.paste(center_crop(img, card_w, img_h), (cx0, cy0))
 
-        # Body (wrap + ellipsis)
-        draw_text_in_box(draw, (x0+18*SCALE, y+245*SCALE, x0+card_w-18*SCALE, y+card_h-18*SCALE),
-                         body, lambda s: f_inter(s, "reg"),
-                         start_size=17, min_size=14, fill=MID,
-                         line_spacing=9, max_lines=3, ellipsis=True)
+        # crop text
+        crop_name = CROP_DISPLAY[ck]
+        crop_acres = next(c.acres for c in imp.crops if c.key == ck)
+        title_box = (cx0+18*SCALE, cy0+img_h+14*SCALE, cx1-18*SCALE, cy0+img_h+60*SCALE)
+        draw_text_block(
+            draw, title_box,
+            crop_name,
+            lambda s: f_playfair(s, "semibold"),
+            start_size=30*SCALE, min_size=22*SCALE,
+            fill=TEXT_DARK, line_gap=4*SCALE, align="left"
+        )
 
-    # Value band
-    y = y + card_h + 24*SCALE
-    val_box = (50*SCALE, y, W-50*SCALE, y+102*SCALE)
-    soft_shadow(base, val_box, r=24*SCALE, blur=18*SCALE, alpha=45)
-    rounded(draw, val_box, r=24*SCALE, fill=PANEL, outline=BORDER, w=2*SCALE)
+        acres_box = (cx0+18*SCALE, cy0+img_h+62*SCALE, cx1-18*SCALE, cy0+img_h+92*SCALE)
+        draw_text_block(
+            draw, acres_box,
+            f"{fmt_acres(crop_acres)} restored",
+            lambda s: f_inter(s, "semibold"),
+            start_size=18*SCALE, min_size=16*SCALE,
+            fill=(30,30,30), line_gap=4*SCALE, align="left"
+        )
 
-    roi = (imp.value_gbp / imp.donation_gbp) if imp.donation_gbp > 0 else 0.0
-    roi_txt = f"{max(1,int(round(roi)))}x"
+        blurb_box = (cx0+18*SCALE, cy0+img_h+92*SCALE, cx1-18*SCALE, cy1-16*SCALE)
+        draw_text_block(
+            draw, blurb_box,
+            crop_blurb(ck),
+            lambda s: f_inter(s, "reg"),
+            start_size=16*SCALE, min_size=14*SCALE,
+            fill=TEXT_MUTED, line_gap=5*SCALE, align="left"
+        )
 
-    draw_text_in_box(draw, (80*SCALE, y+26*SCALE, 350*SCALE, y+84*SCALE),
-                     "Projected impact value", lambda s: f_playfair(s, bold=False),
-                     start_size=22, min_size=16, fill=INK, max_lines=1)
+    y = y + card_h + 22*SCALE
 
-    draw_text_in_box(draw, (350*SCALE, y+10*SCALE, 720*SCALE, y+92*SCALE),
-                     f"≈ {fmt_gbp_smart(imp.value_gbp)}",
-                     lambda s: f_playfair(s, bold=True),
-                     start_size=48, min_size=28, fill=INK, align="center", valign="center", max_lines=1)
+    # Value band (final panel)
+    val_box = (55*SCALE, y, W-55*SCALE, y + 130*SCALE)
+    rounded_panel(draw, val_box, radius=26*SCALE, fill=(249, 247, 242), outline=(220, 212, 200), width=2)
 
-    rhs = f"in harvest value, returning over {roi_txt} the original donation to local farmers and markets."
-    draw_text_in_box(draw, (740*SCALE, y+24*SCALE, W-80*SCALE, y+84*SCALE),
-                     rhs, lambda s: f_inter(s, "reg"),
-                     start_size=18, min_size=13, fill=MUTED, max_lines=2, ellipsis=True)
-
-    # Quote + CTA (bottom)
-    y = y + 126*SCALE
-    left = (50*SCALE, y, 560*SCALE, H-40*SCALE)
-    right = (580*SCALE, y, W-50*SCALE, H-40*SCALE)
-
-    # Quote image
-    qimg_path = pick_crop_photo("sweet_potato") or hero_path
-    qimg = grade(cover(qimg_path, (left[2]-left[0], left[3]-left[1])), contrast=1.05, saturation=1.02)
-    base.paste(qimg, (left[0], left[1]))
-    bottom_fade(base, left, strength=185)
-    soft_shadow(base, left, r=22*SCALE, blur=18*SCALE, alpha=50)
-    rounded(draw, left, r=22*SCALE, fill=None, outline=(240,235,225), w=2*SCALE)
-
-    draw_text_in_box(
-        draw,
-        (left[0]+34*SCALE, left[1]+26*SCALE, left[2]-34*SCALE, left[3]-26*SCALE),
-        copy["quote"],
-        lambda s: f_playfair(s, bold=False),
-        start_size=30,
-        min_size=18,
-        fill=WHITE,
-        line_spacing=10,
-        max_lines=4,
-        ellipsis=True,
-        shadow={"dx":2*SCALE, "dy":2*SCALE, "fill":(0,0,0,160)}
+    # left label
+    draw_text_block(
+        draw, (val_box[0]+30*SCALE, val_box[1]+22*SCALE, val_box[0]+320*SCALE, val_box[3]-22*SCALE),
+        "Projected impact value",
+        lambda s: f_inter(s, "reg"),
+        start_size=18*SCALE, min_size=16*SCALE,
+        fill=(55,55,55), line_gap=4*SCALE, align="left"
+    )
+    # big value
+    draw_text_block(
+        draw, (val_box[0]+320*SCALE, val_box[1]+16*SCALE, val_box[0]+720*SCALE, val_box[3]-16*SCALE),
+        f"≈ {fmt_gbp(imp.projected_value_gbp)}",
+        lambda s: f_playfair(s, "bold"),
+        start_size=52*SCALE, min_size=38*SCALE,
+        fill=TEXT_DARK, line_gap=6*SCALE, align="center"
+    )
+    # right copy
+    draw_text_block(
+        draw, (val_box[0]+740*SCALE, val_box[1]+20*SCALE, val_box[2]-30*SCALE, val_box[3]-20*SCALE),
+        "in harvest value, returning over\n8× the original donation to local\nfarmers and markets.",
+        lambda s: f_inter(s, "reg"),
+        start_size=16*SCALE, min_size=14*SCALE,
+        fill=(70,70,70), line_gap=5*SCALE, align="left"
     )
 
-    # CTA panel
-    soft_shadow(base, right, r=22*SCALE, blur=18*SCALE, alpha=45)
-    rounded(draw, right, r=22*SCALE, fill=PANEL, outline=BORDER, w=2*SCALE)
-
-    draw_text_in_box(draw, (right[0]+34*SCALE, right[1]+22*SCALE, right[2]-34*SCALE, right[1]+80*SCALE),
-                     copy["cta_title"], lambda s: f_playfair(s, bold=True),
-                     start_size=34, min_size=22, fill=INK, max_lines=1)
-
-    draw_text_in_box(draw, (right[0]+34*SCALE, right[1]+78*SCALE, right[2]-34*SCALE, right[1]+155*SCALE),
-                     copy["cta_body"], lambda s: f_inter(s, "reg"),
-                     start_size=20, min_size=15, fill=MUTED, line_spacing=10, max_lines=3, ellipsis=True)
-
-    btn = (right[0]+34*SCALE, right[1]+165*SCALE, right[2]-34*SCALE, right[1]+245*SCALE)
-    soft_shadow(base, btn, r=16*SCALE, blur=14*SCALE, alpha=70)
-    rounded(draw, btn, r=16*SCALE, fill=GREEN_DARK, outline=None)
-
-    draw_text_in_box(draw, btn, copy["cta_button"], lambda s: f_playfair(s, bold=True),
-                     start_size=26, min_size=18, fill=WHITE, align="center", valign="center", max_lines=1)
-
-    draw_text_in_box(draw, (right[0]+34*SCALE, right[1]+252*SCALE, right[2]-34*SCALE, right[1]+292*SCALE),
-                     copy["cta_note"], lambda s: f_inter(s, "reg"),
-                     start_size=16, min_size=12, fill=MUTED, max_lines=2, ellipsis=True)
-
-    # Downsample for crisp result
+    # Done — downsample for crisp output
     out = base.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
     bio = BytesIO()
     out.save(bio, format="PNG", optimize=True)
