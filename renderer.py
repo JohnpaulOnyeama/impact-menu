@@ -16,7 +16,14 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
 # ============================================================
 # Paths / Assets
 # ============================================================
-ASSET_ROOT = os.getenv("ASSET_ROOT", "assets")
+import os
+
+# Absolute path to this file's folder (works on Streamlit Cloud)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Assets folder must be inside the repo root next to app.py / renderer.py
+ASSET_ROOT = os.path.join(BASE_DIR, "assets")
+
 FONT_DIR = os.path.join(ASSET_ROOT, "fonts")
 BG_DIR = os.path.join(ASSET_ROOT, "backgrounds")
 CROP_DIR = os.path.join(ASSET_ROOT, "crops")
@@ -161,6 +168,14 @@ PARISH_COPY = {
         "cta_note": "Funding closes once planting begins.",
     },
 }
+
+
+# Debug (shows in Streamlit logs)
+print("BASE_DIR:", BASE_DIR)
+print("ASSET_ROOT:", ASSET_ROOT)
+print("FONT_DIR:", FONT_DIR)
+print("FONT_DIR exists:", os.path.isdir(FONT_DIR))
+print("FONT files:", os.listdir(FONT_DIR) if os.path.isdir(FONT_DIR) else "missing")
 
 # ============================================================
 # Font auto-detection (works with your filenames)
