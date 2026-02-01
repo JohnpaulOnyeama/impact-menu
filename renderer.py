@@ -110,8 +110,13 @@ class Impact:
 # -------------------------
 # Formatting helpers
 # -------------------------
+
 def fmt_gbp(x: float) -> str:
     return f"£{int(round(x)):,}"
+def fmt_currency(amount: float, currency: str) -> str:
+    symbols = {"GBP": "£", "USD": "$", "JMD": "J$"}
+    symbol = symbols.get(currency, "")
+    return f"{symbol}{int(round(amount)):,}"
 
 def fmt_acres(x: float) -> str:
     if x < 1:
