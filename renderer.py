@@ -83,7 +83,7 @@ TEXT_MUTED = (92, 92, 92)
 
 
 # =========================================================
-# Data types
+# Data types yeaa
 # =========================================================
 @dataclass
 class CropImpact:
@@ -105,6 +105,9 @@ class Impact:
 # =========================================================
 # Formatting helpers
 # =========================================================
+def fmt_gbp(amount: float) -> str:
+    return fmt_currency(amount, "GBP")
+
 def fmt_currency(amount: float, currency: str) -> str:
     symbols = {"GBP": "£", "USD": "$", "JMD": "J$"}
     symbol = symbols.get(currency, "")
